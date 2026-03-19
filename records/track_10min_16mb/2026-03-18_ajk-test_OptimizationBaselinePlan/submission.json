@@ -1,0 +1,12 @@
+{
+  "author": "pending",
+  "github_id": "pending",
+  "name": "Optimization Baseline (Plan)",
+  "blurb": "Planned optimization baseline for codex/ajk-test: moderate depth recurrence (6 unique layers looped 2x at 512 dim) plus a late-phase compression-aware quantized-shadow objective, with the first goal of preserving baseline-quality while reducing artifact size.",
+  "date": "2026-03-18T00:00:00Z",
+  "val_loss": null,
+  "val_bpb": null,
+  "bytes_total": null,
+  "bytes_code": null,
+  "status": "planned, not yet run"
+}

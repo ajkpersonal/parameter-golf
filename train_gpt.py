@@ -62,6 +62,8 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
+    num_recurrence = int(os.environ.get("NUM_RECURRENCE", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -69,6 +71,12 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Compression-aware training.
+    compression_aware_mode = os.environ.get("COMPRESSION_AWARE_MODE", "").strip().lower()
+    compression_aware_start_frac = float(os.environ.get("COMPRESSION_AWARE_START_FRAC", 0.60))
+    compression_aware_every = int(os.environ.get("COMPRESSION_AWARE_EVERY", 4))
+    compression_aware_kl_weight = float(os.environ.get("COMPRESSION_AWARE_KL_WEIGHT", 0.10))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -339,6 +347,29 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+
+def fake_quantize_tensor_export_surrogate(t: Tensor) -> Tensor:
+    # Compile-friendly surrogate for the final exporter used only during training.
+    # We avoid torch.quantile here because it breaks the current fullgraph compile path.
+    if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        return t
+
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = t32.abs().amax(dim=1)
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127)
+        deq = (q * scale[:, None]).to(dtype=t.dtype)
+        return t + (deq - t).detach()
+
+    clip_abs = t32.abs().amax()
+    scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+    clipped = torch.clamp(t32, -clip_abs, clip_abs)
+    q = torch.clamp(torch.round(clipped / scale), -127, 127)
+    deq = (q * scale).to(dtype=t.dtype)
+    return t + (deq - t).detach()
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -508,9 +539,10 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, use_fake_quant: bool = False) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        weight = fake_quantize_tensor_export_surrogate(self.weight) if use_fake_quant else self.weight
+        return F.linear(x, weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -580,11 +612,11 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, use_fake_quant: bool = False) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x, use_fake_quant=use_fake_quant).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x, use_fake_quant=use_fake_quant).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x, use_fake_quant=use_fake_quant).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -600,7 +632,7 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y, use_fake_quant=use_fake_quant)
 
 
 class MLP(nn.Module):
@@ -612,9 +644,9 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+    def forward(self, x: Tensor, use_fake_quant: bool = False) -> Tensor:
+        x = torch.relu(self.fc(x, use_fake_quant=use_fake_quant))
+        return self.proj(x.square(), use_fake_quant=use_fake_quant)
 
 
 class Block(nn.Module):
@@ -636,12 +668,15 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, use_fake_quant: bool = False) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), use_fake_quant=use_fake_quant)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
+            self.mlp_norm(x),
+            use_fake_quant=use_fake_quant,
+        )
         return x
 
 
@@ -650,6 +685,8 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_unique_layers: int,
+        num_recurrence: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -659,16 +696,25 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        compression_aware_kl_weight: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if num_unique_layers <= 0:
+            num_unique_layers = num_layers
+        if num_recurrence <= 0:
+            raise ValueError(f"num_recurrence must be positive, got {num_recurrence}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_unique_layers = num_unique_layers
+        self.num_recurrence = num_recurrence
+        self.num_layers = self.num_unique_layers * self.num_recurrence
+        self.compression_aware_kl_weight = compression_aware_kl_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = self.num_layers // 2
+        self.num_decoder_layers = self.num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -681,7 +727,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(self.num_unique_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -697,31 +743,43 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+    def forward_logits(self, input_ids: Tensor, use_fake_quant: bool = False) -> Tensor:
+        emb_weight = fake_quantize_tensor_export_surrogate(self.tok_emb.weight) if use_fake_quant else self.tok_emb.weight
+        x = F.embedding(input_ids, emb_weight) if use_fake_quant else self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_layers](x, x0, use_fake_quant=use_fake_quant)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[i % self.num_unique_layers](x, x0, use_fake_quant=use_fake_quant)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, emb_weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+            logits_proj = self.lm_head(x, use_fake_quant=use_fake_quant)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, compression_aware: bool = False) -> Tensor:
+        logits = self.forward_logits(input_ids, use_fake_quant=False)
+        targets = target_ids.reshape(-1)
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if not compression_aware or self.compression_aware_kl_weight <= 0.0:
+            return ce_loss
+
+        shadow_logits = self.forward_logits(input_ids, use_fake_quant=True)
+        teacher_probs = F.softmax(logits.detach().float(), dim=-1)
+        shadow_log_probs = F.log_softmax(shadow_logits.float(), dim=-1)
+        kl_loss = F.kl_div(shadow_log_probs, teacher_probs, reduction="batchmean")
+        return ce_loss + self.compression_aware_kl_weight * kl_loss
 
 
 # -----------------------------
@@ -826,6 +884,8 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
+        num_recurrence=args.num_recurrence,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -835,6 +895,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        compression_aware_kl_weight=args.compression_aware_kl_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -898,6 +959,10 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
+        f"depth_layout:effective_layers:{base_model.num_layers} "
+        f"unique_layers:{base_model.num_unique_layers} recurrence:{base_model.num_recurrence}"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -906,6 +971,12 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"compression_aware:mode:{args.compression_aware_mode or 'off'} "
+        f"start_frac:{args.compression_aware_start_frac:.2f} "
+        f"every:{args.compression_aware_every} "
+        f"kl_weight:{args.compression_aware_kl_weight:.4f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -945,7 +1016,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, compression_aware=False)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1008,12 +1079,19 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        compression_aware_active = (
+            args.compression_aware_mode == "shadow_int8_kl"
+            and args.compression_aware_every > 0
+            and max_wallclock_ms is not None
+            and elapsed_ms >= max_wallclock_ms * args.compression_aware_start_frac
+            and step % args.compression_aware_every == 0
+        )
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, compression_aware=compression_aware_active)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1042,6 +1120,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"compression_aware_active:{compression_aware_active} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
