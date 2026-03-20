@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -93,6 +98,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    cache_train_shards = bool(int(os.environ.get("CACHE_TRAIN_SHARDS", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -309,42 +315,133 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+LOWBIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("LOWBIT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+LOWBIT_BITS = int(os.environ.get("LOWBIT_BITS", 8))
+LOWBIT_CLIP_PERCENTILE = float(os.environ.get("LOWBIT_CLIP_PERCENTILE", INT8_CLIP_PERCENTILE))
+LOWBIT_CLIP_Q = LOWBIT_CLIP_PERCENTILE / 100.0
+SERIAL_COMPRESSOR = os.environ.get("SERIAL_COMPRESSOR", "zlib").strip().lower()
+SERIAL_ZLIB_LEVEL = int(os.environ.get("SERIAL_ZLIB_LEVEL", 9))
+SERIAL_ZSTD_LEVEL = int(os.environ.get("SERIAL_ZSTD_LEVEL", 22))
+
+
+def parse_group_overrides(raw: str) -> tuple[tuple[str, int], ...]:
+    parsed: list[tuple[str, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        pattern, sep, group_size_str = item.partition(":")
+        if not sep:
+            raise ValueError(f"Expected PATTERN:GROUP_SIZE in INT8_GROUP_OVERRIDES, got {item!r}")
+        parsed.append((pattern, int(group_size_str)))
+    return tuple(parsed)
+
+
+INT8_GROUP_OVERRIDES = parse_group_overrides(os.environ.get("INT8_GROUP_OVERRIDES", ""))
+
+
+def matches_any(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
+
+def group_size_for_name(name: str) -> int | None:
+    for pattern, group_size in INT8_GROUP_OVERRIDES:
+        if pattern in name:
+            return group_size
+    return None
+
+
+def lowbit_is_active_for_name(name: str) -> bool:
+    return LOWBIT_BITS < 8 and matches_any(name, LOWBIT_NAME_PATTERNS)
+
+
+def export_variant_tag() -> str:
+    if LOWBIT_BITS < 8 and LOWBIT_NAME_PATTERNS:
+        return f"mixed_int{LOWBIT_BITS}_{SERIAL_COMPRESSOR}"
+    return f"int8_{SERIAL_COMPRESSOR}"
+
+
+def export_variant_desc() -> str:
+    if LOWBIT_BITS < 8 and LOWBIT_NAME_PATTERNS:
+        return f"mixed-int{LOWBIT_BITS}+{SERIAL_COMPRESSOR}"
+    return f"int8+{SERIAL_COMPRESSOR}"
+
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if matches_any(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
+    if matches_any(name, INT8_KEEP_FLOAT_NAME_PATTERNS):
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quant_range(bits: int) -> tuple[int, int]:
+    qmax = 127 if bits >= 8 else max((1 << (bits - 1)) - 1, 1)
+    return -qmax, qmax
+
+
+def quantize_float_tensor(
+    t: Tensor,
+    *,
+    bits: int = 8,
+    group_size: int | None = None,
+    clip_q: float = INT8_CLIP_Q,
+) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    qmin, qmax = quant_range(bits)
+    scale_floor = 1.0 / max(qmax, 1)
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
+        if group_size is not None and group_size > 0 and t32.shape[1] > group_size:
+            rows, cols = t32.shape
+            groups = math.ceil(cols / group_size)
+            pad_cols = groups * group_size - cols
+            tpad = F.pad(t32, (0, pad_cols)) if pad_cols else t32
+            grouped = tpad.view(rows, groups, group_size)
+            clip_abs = (
+                torch.quantile(grouped.abs(), clip_q, dim=2)
+                if grouped.numel()
+                else torch.empty((rows, groups), dtype=torch.float32)
+            )
+            clipped = torch.maximum(torch.minimum(grouped, clip_abs[..., None]), -clip_abs[..., None])
+            scale = (clip_abs / qmax).clamp_min(scale_floor)
+            q = torch.clamp(torch.round(clipped / scale[..., None]), qmin, qmax).to(torch.int8)
+            q = q.view(rows, groups * group_size)[..., :cols].contiguous()
+            return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
         clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            torch.quantile(t32.abs(), clip_q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / qmax).clamp_min(scale_floor)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), qmin, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    clip_abs = float(torch.quantile(t32.abs().flatten(), clip_q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), qmin, qmax).to(torch.int8).contiguous()
     return q, scale
 
 
@@ -429,6 +526,80 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+def quantize_state_dict_serial(state_dict: dict[str, Tensor]):
+    # Configurable serializer used by the dense integrated lane:
+    # - optional int6 for selected large matrix groups
+    # - optional grouped int8 for selected matrices
+    # - fp16 passthrough for explicitly selected sensitive tensors
+    # - zlib or zstd outer compression
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if (
+            t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL
+            or matches_any(name, INT8_KEEP_FLOAT_NAME_PATTERNS)
+            or matches_any(name, CONTROL_TENSOR_NAME_PATTERNS)
+        ):
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        bits = LOWBIT_BITS if lowbit_is_active_for_name(name) else 8
+        group_size = group_size_for_name(name)
+        q, s = quantize_float_tensor(
+            t,
+            bits=bits,
+            group_size=group_size if t.ndim == 2 else None,
+            clip_q=LOWBIT_CLIP_Q if bits < 8 else INT8_CLIP_Q,
+        )
+        scheme = "per_row_group" if t.ndim == 2 and group_size is not None and group_size > 0 and t.shape[1] > group_size else (
+            "per_row" if s.ndim > 0 else "per_tensor"
+        )
+        qmeta[name] = {"scheme": scheme, "bits": bits}
+        if scheme == "per_row_group":
+            qmeta[name]["group_size"] = int(group_size)
+            qmeta[name]["axis"] = 1
+        elif scheme == "per_row":
+            qmeta[name]["axis"] = 0
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "mixed_lowbit_v2",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+        "qmeta": qmeta,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
@@ -436,7 +607,13 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        scheme = qmeta.get(name, {}).get("scheme")
+        if scheme == "per_row_group":
+            group_size = int(qmeta[name]["group_size"])
+            scale = s.to(dtype=torch.float32)
+            expanded = torch.repeat_interleave(scale, repeats=group_size, dim=1)[:, : q.shape[1]]
+            out[name] = (q.float() * expanded).to(dtype=dtype).contiguous()
+        elif scheme == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -451,6 +628,26 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+def compress_serialized_model(raw: bytes) -> bytes:
+    if SERIAL_COMPRESSOR == "zlib":
+        return zlib.compress(raw, level=SERIAL_ZLIB_LEVEL)
+    if SERIAL_COMPRESSOR == "zstd":
+        if zstandard is None:
+            raise RuntimeError("SERIAL_COMPRESSOR=zstd requires the zstandard package")
+        return zstandard.ZstdCompressor(level=SERIAL_ZSTD_LEVEL).compress(raw)
+    raise ValueError(f"Unsupported SERIAL_COMPRESSOR={SERIAL_COMPRESSOR!r}")
+
+
+def decompress_serialized_model(blob: bytes) -> bytes:
+    if SERIAL_COMPRESSOR == "zlib":
+        return zlib.decompress(blob)
+    if SERIAL_COMPRESSOR == "zstd":
+        if zstandard is None:
+            raise RuntimeError("SERIAL_COMPRESSOR=zstd requires the zstandard package")
+        return zstandard.ZstdDecompressor().decompress(blob)
+    raise ValueError(f"Unsupported SERIAL_COMPRESSOR={SERIAL_COMPRESSOR!r}")
 
 
 # -----------------------------
@@ -477,17 +674,23 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, cache_shards: bool = False):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
+        self.cache_shards = cache_shards
+        self._cached_tokens = [load_data_shard(file) for file in self.files] if cache_shards else None
+        self.tokens = self._cached_tokens[0] if self._cached_tokens is not None else load_data_shard(self.files[0])
         self.pos = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.tokens = (
+            self._cached_tokens[self.file_idx]
+            if self._cached_tokens is not None
+            else load_data_shard(self.files[self.file_idx])
+        )
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
@@ -508,11 +711,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, cache_shards: bool = False):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, cache_shards=cache_shards)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -712,9 +915,11 @@ class GPT(nn.Module):
         self.num_recurrence = num_recurrence
         self.num_layers = self.num_unique_layers * self.num_recurrence
         self.compression_aware_kl_weight = compression_aware_kl_weight
+        self.reuse_blocks_across_halves = self.num_layers > self.num_unique_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = self.num_layers // 2
         self.num_decoder_layers = self.num_layers - self.num_encoder_layers
+        self.decoder_block_offset = 0 if self.reuse_blocks_across_halves else self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -757,7 +962,8 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[i % self.num_unique_layers](x, x0, use_fake_quant=use_fake_quant)
+            block_idx = (i % self.num_unique_layers) if self.reuse_blocks_across_halves else (self.decoder_block_offset + i)
+            x = self.blocks[block_idx](x, x0, use_fake_quant=use_fake_quant)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
@@ -984,7 +1190,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, cache_shards=args.cache_train_shards)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1029,7 +1235,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, cache_shards=args.cache_train_shards)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1142,7 +1348,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the configured compressed artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1152,29 +1358,36 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_serial(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = compress_serialized_model(quant_raw)
     quant_raw_bytes = len(quant_raw)
+    artifact_tag = export_variant_tag()
+    artifact_desc = export_variant_desc()
+    artifact_path = "final_model.quant.ptz"
+    legacy_artifact_path = "final_model.int8.ptz"
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(artifact_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        # Keep the legacy filename as an alias because local helper scripts copy it.
+        with open(legacy_artifact_path, "wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = os.path.getsize(artifact_path)
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model {artifact_desc}: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {artifact_desc}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(artifact_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(decompress_serialized_model(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1192,10 +1405,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{artifact_tag}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{artifact_tag}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

@@ -9,3 +9,8 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+artifacts/
+final_model.pt
+final_model.int8.ptz
+final_model.quant.ptz
+notes/.ipynb_checkpoints/
