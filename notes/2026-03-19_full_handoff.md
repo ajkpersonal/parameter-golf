@@ -56,6 +56,13 @@ Implementation status:
     - [final_model.int8.ptz](/workspace/parameter-golf/final_model.int8.ptz) as a legacy alias for local helper scripts
 - prefilled launcher for the new lane:
   - [run_dense_integrated_lane.sh](/workspace/parameter-golf/scripts/run_dense_integrated_lane.sh)
+- [checkpoint_frontier_sweep.py](/workspace/parameter-golf/scripts/checkpoint_frontier_sweep.py) now reuses the integrated serializer path from [train_gpt.py](/workspace/parameter-golf/train_gpt.py) instead of its older standalone low-bit approximation
+- first bounded exporter-transfer check on the saved seq2048 winner:
+  - [seq2048_export_transfer_smoke.csv](/workspace/parameter-golf/logs/seq2048_export_transfer_smoke.csv)
+  - variant: `int6_zstd_core_fp16_embed_latek`
+  - evaluator: `stream_sliding 2048/256`
+  - bounded result on first `20` docs: `1.37096764`
+  - artifact size: `12,956,566` bytes
 
 What is now effectively archived:
 
@@ -1041,11 +1048,10 @@ What is no longer the focus:
 
 The immediate next work after this handoff update is:
 
-1. make [checkpoint_frontier_sweep.py](/workspace/parameter-golf/scripts/checkpoint_frontier_sweep.py) reuse the new integrated serializer logic from [train_gpt.py](/workspace/parameter-golf/train_gpt.py)
-2. re-export and score the saved `12m` seq2048 winner under the improved stack before retraining anything
-3. run two integrated `12m` seq2048 retrains with the same improved stack:
+1. run the full-val exporter-transfer measurement on the saved `12m` seq2048 winner under the improved stack
+2. run two integrated `12m` seq2048 retrains with the same improved stack:
    - `MLP_MULT=2`
    - `MLP_MULT=3`
-4. if one of those is directionally good, repeat at `20m`
-5. do not jump straight back to `40m` on the one-shard proxy until the schedule is retuned to the longer horizon
-6. only after the base model is stronger, return to scaling test-time compute toward the full `600s` budget
+3. if one of those is directionally good, repeat at `20m`
+4. do not jump straight back to `40m` on the one-shard proxy until the schedule is retuned to the longer horizon
+5. only after the base model is stronger, return to scaling test-time compute toward the full `600s` budget

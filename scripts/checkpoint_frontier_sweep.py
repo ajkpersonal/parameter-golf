@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import glob
 import io
@@ -10,13 +11,11 @@ import math
 import os
 import sys
 import time
-import zlib
 from pathlib import Path
 
 import sentencepiece as spm
 import torch
 import torch.nn.functional as F
-import zstandard
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -54,6 +53,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated subset of variant names to run (e.g. prequant,int8_zlib)",
     )
     parser.add_argument("--late-k-patterns", default="", help="Comma-separated additional fp16 keep-float patterns")
+    parser.add_argument("--k-group-size", type=int, default=64, help="Grouped int8 group size for non-passthrough c_k weights")
     parser.add_argument("--max-docs", type=int, default=0, help="If >0, only evaluate the first N documents")
     parser.add_argument("--max-val-tokens", type=int, default=0, help="If >0, only evaluate the first N tokens")
     return parser.parse_args()
@@ -134,134 +134,58 @@ def parse_int_list(text: str, fallback: int) -> list[int]:
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
 
-def matches_any(name: str, patterns: tuple[str, ...]) -> bool:
-    return any(pattern in name for pattern in patterns)
-
-
-def quantize_int6_per_row(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        row_max = t32.abs().amax(dim=1)
-        scale = (row_max / 31.0).clamp_min(1e-12).to(torch.float16)
-        scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -32, 31).to(torch.int8).contiguous()
-        return q, scale.contiguous()
-    amax = t32.abs().max().item()
-    scale = torch.tensor(max(amax / 31.0, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / float(scale.item())), -32, 31).to(torch.int8).contiguous()
-    return q, scale
-
-
-def keep_float_tensor(
-    name: str,
-    t: torch.Tensor,
+@contextlib.contextmanager
+def serializer_overrides(
+    *,
     keep_fp16_patterns: tuple[str, ...],
-    passthrough_orig_dtypes: dict[str, str],
-) -> torch.Tensor:
-    if matches_any(name, train_gpt.CONTROL_TENSOR_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=torch.float16).contiguous()
-    if matches_any(name, keep_fp16_patterns):
-        return t.to(dtype=torch.float16).contiguous()
-    return t
-
-
-def quantize_state_dict_variant(
-    state_dict: dict[str, torch.Tensor],
-    keep_fp16_patterns: tuple[str, ...],
-    int6_patterns: tuple[str, ...],
-) -> tuple[dict[str, object], dict[str, int]]:
-    quantized: dict[str, torch.Tensor] = {}
-    scales: dict[str, torch.Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, torch.Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "payload_bytes"),
-        0,
-    )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += train_gpt.tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["payload_bytes"] += train_gpt.tensor_nbytes(t)
-            continue
-
-        if (
-            t.numel() <= train_gpt.INT8_KEEP_FLOAT_MAX_NUMEL
-            or matches_any(name, keep_fp16_patterns)
-            or matches_any(name, train_gpt.CONTROL_TENSOR_NAME_PATTERNS)
-        ):
-            kept = keep_float_tensor(name, t, keep_fp16_patterns, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["payload_bytes"] += train_gpt.tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        if t.ndim == 2 and matches_any(name, int6_patterns):
-            q, s = quantize_int6_per_row(t)
-            qmeta[name] = {"scheme": "per_row", "bits": 6}
-        else:
-            q, s = train_gpt.quantize_float_tensor(t)
-            qmeta[name] = {"scheme": "per_row" if s.ndim > 0 else "per_tensor", "bits": 8}
-
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["payload_bytes"] += train_gpt.tensor_nbytes(q) + train_gpt.tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "mixed_lowbit_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-        "qmeta": qmeta,
+    lowbit_patterns: tuple[str, ...],
+    lowbit_bits: int,
+    group_overrides: tuple[tuple[str, int], ...],
+    compressor: str,
+):
+    saved = {
+        "INT8_KEEP_FLOAT_NAME_PATTERNS": train_gpt.INT8_KEEP_FLOAT_NAME_PATTERNS,
+        "LOWBIT_NAME_PATTERNS": train_gpt.LOWBIT_NAME_PATTERNS,
+        "LOWBIT_BITS": train_gpt.LOWBIT_BITS,
+        "INT8_GROUP_OVERRIDES": train_gpt.INT8_GROUP_OVERRIDES,
+        "SERIAL_COMPRESSOR": train_gpt.SERIAL_COMPRESSOR,
     }
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
+    try:
+        train_gpt.INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(keep_fp16_patterns)
+        train_gpt.LOWBIT_NAME_PATTERNS = tuple(lowbit_patterns)
+        train_gpt.LOWBIT_BITS = int(lowbit_bits)
+        train_gpt.INT8_GROUP_OVERRIDES = tuple(group_overrides)
+        train_gpt.SERIAL_COMPRESSOR = compressor
+        yield
+    finally:
+        for key, value in saved.items():
+            setattr(train_gpt, key, value)
 
 
-def dequantize_state_dict_variant(obj: dict[str, object]) -> dict[str, torch.Tensor]:
-    out: dict[str, torch.Tensor] = {}
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if s.ndim > 0:
-            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
-
-
-def compress_obj(obj: dict[str, object], compressor: str) -> tuple[bytes, int]:
-    buf = io.BytesIO()
-    torch.save(obj, buf)
-    raw = buf.getvalue()
-    if compressor == "zlib":
-        blob = zlib.compress(raw, level=9)
-    elif compressor == "zstd":
-        blob = zstandard.ZstdCompressor(level=22).compress(raw)
-    else:
-        raise ValueError(f"Unsupported compressor: {compressor}")
-    return blob, len(raw)
+def serialize_variant_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    keep_fp16_patterns: tuple[str, ...],
+    lowbit_patterns: tuple[str, ...],
+    lowbit_bits: int,
+    group_overrides: tuple[tuple[str, int], ...],
+    compressor: str,
+) -> tuple[bytes, int, int, dict[str, torch.Tensor]]:
+    with serializer_overrides(
+        keep_fp16_patterns=keep_fp16_patterns,
+        lowbit_patterns=lowbit_patterns,
+        lowbit_bits=lowbit_bits,
+        group_overrides=group_overrides,
+        compressor=compressor,
+    ):
+        qobj, stats = train_gpt.quantize_state_dict_serial(state_dict)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        raw = buf.getvalue()
+        blob = train_gpt.compress_serialized_model(raw)
+        restored = torch.load(io.BytesIO(train_gpt.decompress_serialized_model(blob)), map_location="cpu")
+        dequantized_state = train_gpt.dequantize_state_dict_int8(restored)
+    return blob, len(raw), stats["payload_bytes"], dequantized_state
 
 
 def load_validation_tokens_full(pattern: str) -> torch.Tensor:
@@ -477,20 +401,48 @@ def main() -> None:
     code_bytes = Path("train_gpt.py").stat().st_size
 
     late_k_patterns = parse_patterns(args.late_k_patterns)
+    core_lowbit_patterns = (".mlp.", ".attn.c_q.", ".attn.c_v.", ".attn.proj.")
+    k_group_overrides = ((".attn.c_k.", args.k_group_size),) if args.k_group_size > 0 else tuple()
     variants = [
-        {"name": "int8_zlib", "compressor": "zlib", "keep_fp16": tuple(), "int6": tuple()},
-        {"name": "int8_zlib_fp16_embed", "compressor": "zlib", "keep_fp16": ("tok_emb.weight",), "int6": tuple()},
+        {
+            "name": "int8_zlib",
+            "compressor": "zlib",
+            "keep_fp16": tuple(),
+            "lowbit": tuple(),
+            "lowbit_bits": 8,
+            "group_overrides": tuple(),
+        },
+        {
+            "name": "int8_zlib_fp16_embed",
+            "compressor": "zlib",
+            "keep_fp16": ("tok_emb.weight",),
+            "lowbit": tuple(),
+            "lowbit_bits": 8,
+            "group_overrides": tuple(),
+        },
         {
             "name": "int6_zstd_core",
             "compressor": "zstd",
             "keep_fp16": tuple(),
-            "int6": (".mlp.", ".attn.c_q.", ".attn.c_v.", ".attn.proj."),
+            "lowbit": core_lowbit_patterns,
+            "lowbit_bits": 6,
+            "group_overrides": tuple(),
         },
         {
             "name": "int6_zstd_core_fp16_embed",
             "compressor": "zstd",
             "keep_fp16": ("tok_emb.weight",),
-            "int6": (".mlp.", ".attn.c_q.", ".attn.c_v.", ".attn.proj."),
+            "lowbit": core_lowbit_patterns,
+            "lowbit_bits": 6,
+            "group_overrides": tuple(),
+        },
+        {
+            "name": "int6_zstd_core_fp16_embed_groupk",
+            "compressor": "zstd",
+            "keep_fp16": ("tok_emb.weight",),
+            "lowbit": core_lowbit_patterns,
+            "lowbit_bits": 6,
+            "group_overrides": k_group_overrides,
         },
     ]
     if late_k_patterns:
@@ -499,11 +451,22 @@ def main() -> None:
                 "name": "int6_zstd_core_fp16_embed_latek",
                 "compressor": "zstd",
                 "keep_fp16": ("tok_emb.weight",) + late_k_patterns,
-                "int6": (".mlp.", ".attn.c_q.", ".attn.c_v.", ".attn.proj."),
+                "lowbit": core_lowbit_patterns,
+                "lowbit_bits": 6,
+                "group_overrides": k_group_overrides,
             }
         )
 
-    all_variants = [{"name": "prequant", "compressor": "none", "keep_fp16": tuple(), "int6": tuple()}] + variants
+    all_variants = [
+        {
+            "name": "prequant",
+            "compressor": "none",
+            "keep_fp16": tuple(),
+            "lowbit": tuple(),
+            "lowbit_bits": 8,
+            "group_overrides": tuple(),
+        }
+    ] + variants
     if variant_name_filter:
         all_variants = [variant for variant in all_variants if variant["name"] in variant_name_filter]
 
@@ -512,15 +475,16 @@ def main() -> None:
             model_bytes = "NA"
             artifact_bytes = "NA"
         else:
-            qobj, stats = quantize_state_dict_variant(state_dict, variant["keep_fp16"], variant["int6"])
-            blob, raw_bytes = compress_obj(qobj, variant["compressor"])
+            blob, _raw_bytes, _payload_bytes, dequantized_state = serialize_variant_state_dict(
+                state_dict,
+                keep_fp16_patterns=variant["keep_fp16"],
+                lowbit_patterns=variant["lowbit"],
+                lowbit_bits=variant["lowbit_bits"],
+                group_overrides=variant["group_overrides"],
+                compressor=variant["compressor"],
+            )
             model_bytes = len(blob)
             artifact_bytes = model_bytes + code_bytes
-            dequantized_state = (
-                dequantize_state_dict_variant(torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu"))
-                if variant["compressor"] == "zlib"
-                else dequantize_state_dict_variant(torch.load(io.BytesIO(zstandard.ZstdDecompressor().decompress(blob)), map_location="cpu"))
-            )
             base_model.load_state_dict(dequantized_state, strict=True)
 
         for eval_seq_len in eval_seq_lens:
